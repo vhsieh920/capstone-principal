@@ -1,0 +1,199 @@
+---
+title: "Capstone_EWP"
+author: "Arvind Koul"
+date: "October 16, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include = F}
+library(randomForest)
+library(tidyverse)
+library(magrittr)
+library(VIM)
+library(caret)
+library(mice)
+df <- read_csv("Full_Monthly.csv")
+features <- read_csv("aaaa.csv") #Grace's features
+features <- features$`0`
+```
+
+
+```{r}
+df_model <- df %>% select(Date, features, OAS)
+sapply(df_model, class)
+cols.char <- c("VIX.VXV","Yield.1.Mo.Vol.21", "Yield.1.Mo.Vol.63")
+df_model[cols.char] <- sapply(df_model[cols.char],as.numeric)
+sapply(df_model, class)
+```
+
+
+```{r}
+df_train <- df_model %>% group_by(Date) %>% summarise_at(vars(Yield.30.Yr.Vol.21 : OAS), mean, na.rm = T)
+```
+
+
+```{r}
+sum(!complete.cases(df_train)) 
+```
+
+
+```{r}
+na_plot <- aggr(df_train, col=c('navyblue','yellow'),
+                    numbers=TRUE, sortVars=TRUE,
+                    labels=names(df_train), cex.axis=.7,
+                    gap=3, ylab=c("Missing data","Pattern"))
+
+
+apply(df_train,2,function(x) (100*sum(is.na(x)))/length(x))
+
+```
+
+
+
+```{r}
+nsv = nearZeroVar(df_train, saveMetrics = TRUE)
+# The column names which are close to zero variance are
+rownames(nsv)[nsv$nzv]
+
+```
+
+
+
+```{r}
+na_cols <- colnames(df_train)[colSums(is.na(df_train)) > 0]
+mice_train <- df_train %>% select(na_cols)
+# looking the proportion of mising values one last time
+apply(mice_train,2,function(x) (100*sum(is.na(x)))/length(x))
+
+
+mice_impute <- mice(mice_train, m=1, maxit = 50, 
+    method = c('pmm'), seed = 500)
+
+# Getting the complete data with all the imputed values.
+complete.data <- complete(mice_impute, 1)
+
+apply(complete.data,2,function(x) (100*sum(is.na(x)))/length(x))
+
+df_train <- df_train[, !(names(df_train) %in% na_cols)]
+train_imputed <- cbind.data.frame(df_train, complete.data)
+apply(train_imputed,2,function(x) (100*sum(is.na(x)))/length(x))
+```
+
+
+```{r}
+train_imputed %<>% select(-Date)
+train_imputed$OAS_change <- (train_imputed$OAS - lag(train_imputed$OAS))/lag(train_imputed$OAS)*100
+train_imputed$OAS_change <- lead(train_imputed$OAS_change, 1)
+train_imputed <- na.omit(train_imputed)
+```
+
+```{r}
+grep("Gross Margin", colnames(train_imputed))
+
+colnames(train_imputed)[33] <- "Gross_Margin"
+
+train_imputed <- train_imputed %>% select(-OAS)  
+```
+
+
+```{r}
+#1 week test
+test_frame = 1 
+#start with 6 years
+iterations = seq(from = 36, to = 232 - test_frame, by = test_frame)
+
+iter_count = 1
+expanding.test = c()
+expanding.pred = c()
+
+for(i in iterations){
+  train = train_imputed[1:i,]
+  test = train_imputed[i+test_frame,]
+  fit = randomForest(OAS_change~., data=train_imputed, importance=TRUE, ntree=100)#, na.action = na.omit)
+  pred = predict(fit, test)
+  
+  expanding.test[iter_count] = test$OAS_change
+  expanding.pred[iter_count] = pred # prob of outperformance
+  
+  iter_count = iter_count + 1
+}
+```
+
+
+```{r}
+RMSE <- sqrt((expanding.pred - expanding.test)^2)
+mean(RMSE[1:196])
+plot(RMSE)
+title(main = "RMSE over time")
+```
+
+
+```{r}
+df_train <- df_model %>% group_by(Date) %>% summarise_at(vars(Yield.30.Yr.Vol.21 : OAS), mean, na.rm = T)
+df_train %<>% select(-Date)
+df_train$OAS_change <- (df_train$OAS - lag(df_train$OAS))/lag(df_train$OAS)*100
+df_train <- df_train[-1,]
+names(df_train)
+df_train %<>% select(-OAS)
+```
+
+```{r}
+grep("Gross Margin", colnames(df_train))
+
+colnames(df_train)[38] <- "Gross_Margin"
+
+df_train <- read_rds("df_train.rds")
+df_train$OAS_change <- lead(df_train$OAS_change, 1)
+df_train <- df_train[-233,]
+```
+
+
+```{r}
+#1 week test
+test_frame = 1 
+#start with 6 years
+iterations = seq(from = 36, to = 233  - test_frame, by = test_frame)
+
+iter_count = 1
+expanding.test = c()
+expanding.pred = c()
+
+for(i in iterations){
+  train = df_train[1:i,]
+  test = df_train[i+test_frame,]
+  fit = randomForest(OAS_change~., data=df_train, importance=TRUE, ntree=100, na.action = na.omit) 
+  #Do i need to take lead of OAS change as response 
+  pred = predict(fit, test)
+  
+  expanding.test[iter_count] = test$OAS_change
+  expanding.pred[iter_count] = pred # prob of outperformance
+  
+  iter_count = iter_count + 1
+}
+```
+
+```{r}
+RMSE <- sqrt((expanding.pred - expanding.test)^2)
+mean(RMSE[1:197], na.rm = T)
+sum(is.na(RMSE))
+plot(RMSE)
+title(main = "RMSE over time")
+```
+
+
+```{r}
+sum(is.na(df_train))
+which(is.na(df_train), arr.ind=TRUE)
+```
+
+
+```{r}
+saveRDS(df_train, "df_train.rds")
+saveRDS(train_imputed, "train_imputed.rds")
+```
+
+
