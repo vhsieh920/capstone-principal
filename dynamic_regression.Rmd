@@ -1,0 +1,210 @@
+---
+title: "dynamic_regression"
+author: "eric"
+date: "November 3, 2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+feature <- read.csv("features.csv")
+data <- read.csv("Full_Monthly.csv")
+library(dplyr)
+head(data)
+data$Date <- as.Date(data$Date)
+```
+
+```{r}
+print(colnames(feature))
+colnames(data)
+```
+
+```{r}
+# RTN, DE, PG
+
+library(forecast)
+
+data %>%filter(Ticker == "RTN") %>%   filter(Date >= "2013-01-01") %>% arrange(Date) %>% 
+select("OAS","VIX.VXV","VIX.Value","Current.Market.Cap", "Gross.Margin", "Interest.Expense", "Shares.Outstanding", "Gross.Margin", "Cash.From.Operations","Net.Debt", "Stock.Price","Net.Income.Net.Profit..Losses.","EBITDA.Margin") -> sub_rtn
+
+sub_rtn$change_OAS <- (sub_rtn$OAS - lag(sub_rtn$OAS)) / sub_rtn$OAS
+
+sub_rtn <- na.omit(sub_rtn[,c(2:length(colnames(sub_rtn)))])
+  
+head(sub_rtn)
+
+
+train <- sub_rtn[c(1:(nrow(sub_rtn)-3)),]
+
+var_list <- colnames(train)
+
+test <- sub_rtn[c(nrow(sub_rtn)-2):nrow(sub_rtn),]
+
+Regressors <-  cbind(train[var_list[1:(length(var_list)-1)]])
+best_arima <- auto.arima(train$change_OAS,allowdrift=TRUE,xreg=Regressors,ic="bic",stepwise=FALSE)
+predict_value <- predict(best_arima,newxreg = cbind(test[var_list[1:(length(var_list)-1)]]),3)$pred
+
+predict_value <- c(predict_value[[1]],predict_value[[2]],predict_value[[3]])
+
+
+predict_value
+test$change_OAS
+```
+
+
+
+```{r}
+true_value <- matrix(0, nrow=(239-74), ncol=5)
+predict_value <- matrix(0, nrow=(239-74), ncol=5)
+null_value <- c()
+
+count <- 1
+
+for(ticker in unique(data$Ticker)){
+  
+  data %>%filter(Ticker == ticker) %>%   filter(Date >= "2013-01-01") %>% arrange(Date) %>% 
+select("OAS","VIX.VXV","VIX.Value","Current.Market.Cap", "Gross.Margin", "Interest.Expense", "Shares.Outstanding", "Gross.Margin", "Cash.From.Operations","Net.Debt", "Stock.Price","Net.Income.Net.Profit..Losses.","EBITDA.Margin") -> raw_rtn
+  if(nrow(raw_rtn) != 60){
+    null_value[(length(null_value)+1)] <- ticker
+    next
+  }
+  for(i in seq(1,5)){
+    sub_rtn <- raw_rtn
+    sub_rtn <- sub_rtn[,colSums(is.na(sub_rtn))<nrow(sub_rtn)]
+    sub_rtn$change_OAS <- (sub_rtn$OAS - lag(sub_rtn$OAS)) / sub_rtn$OAS
+    sub_rtn <- na.omit(sub_rtn[,c(2:length(colnames(sub_rtn)))])
+    train <- sub_rtn[c(1:(nrow(sub_rtn)-i)),]
+    var_list <- colnames(train)
+    test <- sub_rtn[c(nrow(sub_rtn)-i+1),]
+    
+    Regressors <-  cbind(train[var_list[1:(length(var_list)-1)]])
+    
+    try(best_arima <- auto.arima(train$change_OAS,allowdrift=TRUE,xreg=Regressors,ic="bic"))
+    
+    try(predicted <- predict(best_arima,newxreg = cbind(test[var_list[1:(length(var_list)-1)]]),1)$pred[[1]])
+    
+    try(predict_value[[count,i]] <- predicted)
+    try(true_value[[count,i]] <- test$change_OAS)
+  }
+  count <- count +1
+}
+
+tn <-  sum(predict_value[which(true_value > 0)]>0)
+tp <- sum(predict_value[which(true_value < 0)]<0)
+fp <- sum(true_value[which(predict_value > 0)]<0)
+fn <- sum(true_value[which(predict_value < 0)]>0)
+
+precision <- (tn + tp ) / (tp + tn + fp + fn)
+recall <- tp / (tp + fp)
+precision
+recall
+
+se <- (true_value - predict_value)^2
+mse <- mean(se)
+mse
+```
+
+
+```{r}
+precision
+recall
+
+mse
+
+ae <- abs(true_value - predict_value)
+
+mae <- mean(ae)
+mae
+
+mean(abs(true_value))
+
+```
+
+```{r}
+# RTN, DE, PG
+true_value <- matrix(0, nrow=3, ncol=5)
+predict_value <- matrix(0, nrow=3, ncol=5)
+null_value <- c()
+
+count <- 1
+
+for(ticker in c("RTN", "DE", "PG")){
+  
+  data %>%filter(Ticker == ticker) %>%   filter(Date >= "2013-01-01") %>% arrange(Date) %>% 
+select("OAS","VIX.VXV","VIX.Value","Current.Market.Cap", "Gross.Margin", "Interest.Expense", "Shares.Outstanding", "Gross.Margin", "Cash.From.Operations","Net.Debt", "Stock.Price","Net.Income.Net.Profit..Losses.","EBITDA.Margin") -> raw_rtn
+  if(nrow(raw_rtn) != 60){
+    null_value[(length(null_value)+1)] <- ticker
+    next
+  }
+  for(i in seq(1,5)){
+    sub_rtn <- raw_rtn
+    sub_rtn <- sub_rtn[,colSums(is.na(sub_rtn))<nrow(sub_rtn)]
+    sub_rtn$change_OAS <- (sub_rtn$OAS - lag(sub_rtn$OAS)) / sub_rtn$OAS
+    sub_rtn <- na.omit(sub_rtn[,c(2:length(colnames(sub_rtn)))])
+    train <- sub_rtn[c(1:(nrow(sub_rtn)-i)),]
+    var_list <- colnames(train)
+    test <- sub_rtn[c(nrow(sub_rtn)-i+1),]
+    
+    Regressors <-  cbind(train[var_list[1:(length(var_list)-1)]])
+    
+    best_arima <- auto.arima(train$change_OAS,allowdrift=TRUE,xreg=Regressors,ic="bic",stepwise=FALSE)
+    
+    predicted <- predict(best_arima,newxreg = cbind(test[var_list[1:(length(var_list)-1)]]),1)$pred[[1]]
+    
+    predict_value[[count,i]] <- predicted
+    true_value[[count,i]] <- test$change_OAS
+  }
+  count <- count +1
+}
+
+
+tn <-  sum(predict_value[which(true_value > 0)]>0)
+tp <- sum(predict_value[which(true_value < 0)]<0)
+
+fp <- sum(true_value[which(predict_value > 0)]<0)
+fn <- sum(true_value[which(predict_value < 0)]>0)
+
+
+precision <- (tn + tp ) / (tp + tn + fp + fn)
+recall <- tp / (tp + fp)
+
+precision
+recall
+
+
+se <- (true_value - predict_value)^2
+
+mse <- mean(se)
+
+mse
+
+```
+
+
+```{r}
+predict_value
+true_value
+```
+
+
+"Current Market Cap", "Gross Margin", "Interest Expense", "Shares.Outstanding", "EBITA Margin", "Cash From Operations","Long Term Debt", "Total Assets", "Revenue","Long Term Debt","Stock.Price","Net Income/Net Profit (Losses)"
+
+
+```{r}
+# this interesting feature! type ts and rstudio is gonna return the timestamp!
+# Sat Nov  3 11:55:29 2018 ------------------------------
+
+data[,c("X","Current.Market.Cap", "Gross.Margin", "Interest.Expense", "Shares.Outstanding", "Gross.Margin", "Cash.From.Operations","Net.Debt", "Stock.Price","Net.Income.Net.Profit..Losses.","EBITDA.Margin")]
+
+
+```
+
+
+
+
+
