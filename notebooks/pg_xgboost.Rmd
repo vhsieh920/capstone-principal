@@ -1,0 +1,119 @@
+---
+title: "PG_xgboost"
+output: html_document
+---
+
+### Load Library
+```{r}
+load.libraries <- c('dplyr','data.table', 'readxl', 'zoo', 'forecast', 'tseries', 'ggplot2',"randomForest","caret","Matrix","xgboost","rpart","party","pROC","vars")
+install.lib <- load.libraries[!load.libraries %in% installed.packages()]
+for(libs in install.lib) install.packages(libs, dependences = TRUE)
+sapply(load.libraries, require, character = TRUE)
+```
+
+### Read data
+```{r}
+data <- read.csv("Full_Monthly.csv")
+data<-data[,2:ncol(data)]
+```
+
+```{r}
+feature <- read.csv("features.csv")
+```
+
+
+### Data Clean
+```{r}
+getData<-function(x){
+  dt<-data %>% filter(Ticker == x)
+  dtall<-dt[,c(5:81)]
+  #Remove missing values
+  dtallnew<-dtall[ , -which(names(dtall) %in% c("One.Month.Yield","Yield.1.Mo.Vol.63","Yield.1.Mo.Vol.21","VIX.VXV","VXV","Yield.30.Yr.Vol.63","Yield.30.Yr.Vol.21","Thirty.Year.Yield"))]
+  dtallnew<-na.omit(dtallnew)
+  
+  dtallnew$oasdelta<- ((dtallnew$OAS - lag(dtallnew$OAS))/lag(dtallnew$OAS))*100
+  dtallnew[1,70]<-0
+  dtallnew$flag<-ifelse(dtallnew$oasdelta >=0, 1,0)
+  
+  dtvar<-dtallnew[,c(1:66,68,69,71)]
+  dtvar[,c(70:137)]<- ((dtvar[,c(1:68)] - dtvar[,c(1:68)] %>% mutate_all(lag))/(dtvar[,c(1:68)] %>% mutate_all(lag) )) *100
+  dtchange<-dtvar[,c(69:137)]
+  dtchange2<-na.omit(dtchange)
+  dtchange2$newflag<- lead(dtchange2$flag)
+  dtchange2<-dtchange2[,c(2:ncol(dtchange2))]
+  return(dtchange2)
+}
+```
+
+### XGBoost model
+```{r}
+xgfunction<-function(traindt){
+  xgb_grid_param <- expand.grid(
+    nrounds = c(50,1),
+    eta = c(0.1,0.01),
+    max_depth = c(8),
+    gamma = c(0,1,2),
+    colsample_bytree =  c(1,2), 
+    min_child_weight = c(1,2),
+    subsample = c(0.5,1)
+  )
+  
+  
+  
+  xgb_control_param <- trainControl(
+    method = "cv",
+    number = 10,                                                    # save losses across all models
+    classProbs = TRUE,  
+    verboseIter = TRUE,  # set to TRUE for AUC to be computed
+    summaryFunction = twoClassSummary,
+    allowParallel = TRUE
+  )
+  #newdata_dum$targdol_logit<-as.numeric(newdata_dum$targdol_logit)
+  
+  xgb <- caret::train(data.matrix(traindt[,-69]), factor(traindt$newflag,labels = c("No", "Yes")),
+                    method="xgbTree",
+                    trControl=xgb_control_param,
+                    tuneGrid=xgb_grid_param,
+                    metric="auc ",
+                    objective = "binary:logistic")
+  return(xgb)
+}
+```
+
+```{r}
+pgchange<-getData("PG")
+```
+
+```{r}
+pgchange_tr<-pgchange[c(1:170),]
+pgchange_te<-pgchange[c(171:232),]
+```
+
+```{r}
+set.seed(12345)
+pg_xgb<-xgfunction(pgchange_tr)
+```
+
+```{r}
+pg_xgb
+```
+
+
+```{r}
+predictions<-predict(pg_xgb,pgchange_te)
+t<-table(predictions=predictions,actual=pgchange_te$newflag)
+t
+```
+
+```{r}
+rf.probs <- predict(pg_xgb,pgchange_te,type="prob")
+rf.ROC <- roc(predictor=rf.probs$Yes,
+               response=pgchange_te$newflag,
+               levels=rev(levels(as.factor(pgchange_te$newflag))))
+rf.ROC$auc
+```
+
+```{r}
+varImp(pg_xgb)
+```
+
