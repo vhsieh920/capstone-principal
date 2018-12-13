@@ -1,0 +1,602 @@
+---
+title: "Xgboost_bysector"
+output: html_document
+---
+
+### Load Library
+```{r}
+load.libraries <- c('dplyr','data.table', 'readxl', 'zoo', 'forecast', 'tseries', 'ggplot2',"randomForest","caret","Matrix","xgboost","rpart","party","pROC","vars","smooth")
+install.lib <- load.libraries[!load.libraries %in% installed.packages()]
+for(libs in install.lib) install.packages(libs, dependences = TRUE)
+sapply(load.libraries, require, character = TRUE)
+```
+
+### Read data
+```{r}
+data <- read.csv("Full_Monthly.csv")
+data<-data[,2:ncol(data)]
+```
+
+
+### Break by Ticker
+```{r}
+getTicker<-function(x){
+  dt<-data %>% filter(Ticker == x)
+  dtall<-dt[,c(5:81)]
+  #Remove missing values
+  dtallnew<-dtall[ , -which(names(dtall) %in% c("One.Month.Yield","Yield.1.Mo.Vol.63","Yield.1.Mo.Vol.21","VIX.VXV","VXV","Yield.30.Yr.Vol.63","Yield.30.Yr.Vol.21","Thirty.Year.Yield"))]
+  dtallnew<-na.omit(dtallnew)
+  
+  dtallnew$oasdelta<- ((dtallnew$OAS - lag(dtallnew$OAS))/lag(dtallnew$OAS))*100
+  dtallnew[1,70]<-0
+  dtallnew$flag<-ifelse(dtallnew$oasdelta >=0, 1,0)
+  
+  dtvar<-dtallnew[,c(1:66,68,69,71)]
+  dtvar[,c(70:137)]<- ((dtvar[,c(1:68)] - dtvar[,c(1:68)] %>% mutate_all(lag))/(dtvar[,c(1:68)] %>% mutate_all(lag) )) *100
+  dtchange<-dtvar[,c(69:137)]
+  dtchange2<-na.omit(dtchange)
+  dtchange2$newflag<- lead(dtchange2$flag)
+  dtchange2<-dtchange2[,c(2:ncol(dtchange2))]
+  return(dtchange2)
+}
+```
+
+
+### Break by sector
+
+```{r}
+table(data$Sector)
+```
+
+
+```{r}
+getSector<-function(x){
+  dt<-data %>% filter(Sector == x)
+  
+  #Remove missing values
+  dtnew<-dt[ , -which(names(dt) %in% c("One.Month.Yield","Yield.1.Mo.Vol.63","Yield.1.Mo.Vol.21","VIX.VXV","VXV","Yield.30.Yr.Vol.63","Yield.30.Yr.Vol.21","Thirty.Year.Yield"))]
+  dtnew<-na.omit(dtnew)
+  
+  dtset <- dtnew[,c(1,5:73)]
+  
+  # get average
+  dtavg<- dtset %>% group_by(Date) %>% summarise_all("mean",na.rm=T)  
+  
+  # get delta OAS
+  dtavg$oasdelta<- ((dtavg$OAS - lag(dtavg$OAS))/lag(dtavg$OAS))*100
+  dtallnew<-dtavg[,-1]
+  
+  dtallnew[1,70]<-0
+  # get flag
+  dtallnew$flag<-ifelse(dtallnew$oasdelta >=0, 1,0)
+  
+  dtvar<-dtallnew[,c(1:66,68,69,71)]
+  
+  # get %change for all features
+  dtvar[,c(70:137)]<- ((dtvar[,c(1:68)] - dtvar[,c(1:68)] %>% mutate_all(lag))/(dtvar[,c(1:68)] %>% mutate_all(lag) )) *100
+  
+  dtchange<-dtvar[,c(69:137)]
+  dtchange2<-na.omit(dtchange)
+  
+  # get flag for the next period
+  dtchange2$newflag<- lead(dtchange2$flag)
+  dtchange2<-dtchange2[,c(2:ncol(dtchange2))]
+}
+```
+
+
+### Xgboost Model framework
+```{r}
+xgfunction<-function(traindt){
+  xgb_grid_param <- expand.grid(
+    nrounds = c(50,100,150),
+    eta = c(0.1,0.01,0.001),
+    max_depth = c(8,10),
+    gamma = c(0,1,2),
+    colsample_bytree =  c(1,2), 
+    min_child_weight = c(1,2),
+    subsample = c(0.5,1)
+  )
+  
+  
+  
+  xgb_control_param <- trainControl(
+    method = "cv",
+    number = 10,                                                    # save losses across all models
+    classProbs = TRUE,  
+    verboseIter = TRUE,  # set to TRUE for AUC to be computed
+    summaryFunction = twoClassSummary,
+    allowParallel = TRUE
+  )
+  #newdata_dum$targdol_logit<-as.numeric(newdata_dum$targdol_logit)
+  
+  xgb <- caret::train(data.matrix(traindt[ , -which(names(traindt) %in% c("newflag"))]), factor(traindt$newflag,labels = c("No", "Yes")),
+                    method="xgbTree",
+                    trControl=xgb_control_param,
+                    tuneGrid=xgb_grid_param,
+                    metric="auc ",
+                    objective = "binary:logistic")
+  return(xgb)
+}
+```
+
+
+### PG Baseline
+```{r}
+dtchange2<-getTicker("PG")
+
+dt_tr<-dtchange2[c(1:170),]
+
+dt_te<-dtchange2[c(171:231),]
+
+dt_tr$newflag<-as.factor(dt_tr$newflag)
+```
+
+```{r}
+tmp <- cor(dt_tr)
+tmp[upper.tri(tmp)] <- 0
+diag(tmp) <- 0
+
+dt_tr <- dt_tr[,!apply(tmp,2,function(x) any(x > 0.75))]
+
+dt_te<-dtchange2[c(171:231),which(names(dtchange2) %in% names(data.new_tr))]
+```
+
+```{r}
+mylogit <- glm(newflag ~ ., data = dt_tr, family = "binomial")
+```
+
+```{r}
+prob=predict(mylogit,newdata = dt_te, type=c("response"))
+dt_te$prob=prob
+library(pROC)
+g <- roc(newflag ~ prob, data = dt_te)
+plot(g)
+
+g
+```
+
+```{r}
+dt_te$predict<-ifelse(dt_te$prob>0.5, 1,0)
+```
+
+```{r}
+result<-as.data.frame(cbind(dt_te$predict, dt_te$newflag))
+
+colnames(result)[1]<-"predict"
+colnames(result)[2]<-"true"
+result<-result[,-1]
+
+t<-table(predictions=result$predicted,actual=result$true)
+t
+```
+
+```{r}
+write.csv(result,"pgbaseline.csv")
+```
+
+### PG Xgboost
+
+```{r}
+dtchange2<-getTicker("PG")
+dt_tr<-dtchange2[c(1:170),]
+dt_te<-dtchange2[c(171:232),]
+set.seed(123)
+dt_xgb<-xgfunction(dt_tr)
+```
+
+```{r}
+predictions<-predict(dt_xgb,dt_te)
+t<-table(predictions=predictions,actual=dt_te$newflag)
+t
+```
+
+```{r}
+result<-as.data.frame(cbind(predictions, dt_te$newflag))
+result<-result[-nrow(result),]
+result$predicted<-ifelse(result$predictions == 1, 0,1)
+colnames(result)[2]<-"true"
+result<-result[,-1]
+
+t<-table(predictions=result$predicted,actual=result$true)
+t
+```
+
+```{r}
+write.csv(result,"pgresult.csv")
+```
+
+
+```{r}
+rf.probs <- predict(dt_xgb,dt_te,type="prob")
+rf.ROC <- roc(predictor=rf.probs$Yes,
+               response=dt_te$newflag,
+               levels=rev(levels(as.factor(dt_te$newflag))))
+rf.ROC$auc
+```
+
+```{r}
+varImp(dt_xgb)
+```
+
+### Consumer, Non-cyclical - Baseline
+```{r}
+dtchange2<-getSector("Consumer, Non-cyclical")
+dt_tr<-dtchange2[c(1:170),]
+dt_te<-dtchange2[c(171:232),]
+```
+
+
+```{r}
+tmp <- cor(dt_tr)
+tmp[upper.tri(tmp)] <- 0
+diag(tmp) <- 0
+
+dt_tr <- dt_tr[,!apply(tmp,2,function(x) any(x > 0.8))]
+
+dt_te<-dtchange2[c(171:231),which(names(dtchange2) %in% names(dt_tr))]
+```
+
+```{r}
+mylogit <- glm(newflag ~ ., data = dt_tr, family = "binomial")
+```
+
+```{r}
+prob=predict(mylogit,newdata = dt_te, type=c("response"))
+dt_te$prob=prob
+library(pROC)
+g <- roc(newflag ~ prob, data = dt_te)
+plot(g)
+
+g
+```
+
+```{r}
+dt_te$predict<-ifelse(dt_te$prob>0.5, 1,0)
+```
+
+```{r}
+result<-as.data.frame(cbind(dt_te$predict, dt_te$newflag))
+
+colnames(result)[1]<-"predict"
+colnames(result)[2]<-"true"
+
+t<-table(predictions=result$predicted,actual=result$true)
+t
+```
+
+```{r}
+write.csv(result,"consumernc_base.csv")
+```
+
+### Consumer, Non-cyclical
+```{r}
+dtchange2<-getSector("Consumer, Non-cyclical")
+```
+
+```{r}
+dt_tr<-dtchange2[c(1:170),]
+dt_te<-dtchange2[c(171:232),]
+```
+
+```{r}
+set.seed(123)
+dt_xgb<-xgfunction(dt_tr)
+```
+
+```{r}
+dt_xgb
+```
+
+The final values used for the model were nrounds = 50, max_depth = 8, eta = 0.01, gamma =
+ 1, colsample_bytree = 1, min_child_weight = 1 and subsample = 0.5.
+ 
+```{r}
+predictions<-predict(dt_xgb,dt_te)
+t<-table(predictions=predictions,actual=dt_te$newflag)
+t
+```
+
+```{r}
+result<-as.data.frame(cbind(predictions, dt_te$newflag))
+result<-result[-nrow(result),]
+result$predicted<-ifelse(result$predictions == 1, 0,1)
+colnames(result)[2]<-"true"
+result<-result[,-1]
+
+t<-table(predictions=result$predicted,actual=result$true)
+t
+```
+
+```{r}
+write.csv(result,"consumer_nc.csv")
+```
+
+
+```{r}
+rf.probs <- predict(dt_xgb,dt_te,type="prob")
+rf.ROC <- roc(predictor=rf.probs$Yes,
+               response=dt_te$newflag,
+               levels=rev(levels(as.factor(dt_te$newflag))))
+rf.ROC$auc
+```
+
+```{r}
+varImp(dt_xgb)
+```
+
+### Consumer, Non-cyclical - More Features
+```{r}
+dt<-data %>% filter(Sector == "Consumer, Non-cyclical")
+  
+#Remove missing values
+dtnew<-dt[ , -which(names(dt) %in% c("One.Month.Yield","Yield.1.Mo.Vol.63","Yield.1.Mo.Vol.21","VIX.VXV","VXV","Yield.30.Yr.Vol.63","Yield.30.Yr.Vol.21","Thirty.Year.Yield"))]
+dtnew<-na.omit(dtnew)
+
+dtset <- dtnew[,c(1,5:73)]
+
+# get average
+dtavg<- dtset %>% group_by(Date) %>% summarise_all("mean",na.rm=T)  
+
+# get delta OAS
+dtavg$oasdelta<- ((dtavg$OAS - lag(dtavg$OAS))/lag(dtavg$OAS))*100
+dtallnew<-dtavg[,-1]
+
+dtallnew[1,70]<-0
+# get flag
+dtallnew$flag<-ifelse(dtallnew$oasdelta >=0, 1,0)
+
+dtvar<-dtallnew[,c(1:66,68,69,71)]
+
+  # get %change for all features
+  dtvar[,c(70:137)]<- ((dtvar[,c(1:68)] - dtvar[,c(1:68)] %>% mutate_all(lag))/(dtvar[,c(1:68)] %>% mutate_all(lag) )) *100
+  
+# Add 2 period change
+dtvar$Shiller.PE.Ratio.2<-  ((dtvar$Shiller.PE.Ratio - lag(lag(dtvar$Shiller.PE.Ratio))) / lag(lag(dtvar$Shiller.PE.Ratio)) ) *100
+
+dtvar$Supermarkets.OAS.2<-  ((dtvar$Supermarkets.OAS - lag(lag(dtvar$Supermarkets.OAS))) / lag(lag(dtvar$Supermarkets.OAS)) ) *100
+
+dtvar$VIX.Value.2<-  ((dtvar$SP.Index - lag(lag(dtvar$VIX.Value))) / lag(lag(dtvar$VIX.Value)) ) *100
+
+dtvar$Total.2<-  ((dtvar$Total - lag(lag(dtvar$Total))) / lag(lag(dtvar$Total)) ) *100
+
+dtvar$TED.Rate.2<-  ((dtvar$TED.Rate - lag(lag(dtvar$TED.Rate))) / lag(lag(dtvar$TED.Rate)) ) *100
+
+
+dtchange<-dtvar[,c(69:142)]
+dtchange2<-na.omit(dtchange)
+
+# Add the rolling means for the most five important predictors
+dtfive<-dtchange2[,c("Shiller.PE.Ratio.1", "Supermarkets.OAS.1", "VIX.Value.1", "Total.1", "TED.Rate.1")] 
+
+
+dtfive$Shiller.PE.Ratio_MA<-NA
+dtfive[c(3:nrow(dtfive)),"Shiller.PE.Ratio_MA"]<-rollmean(dtfive$Shiller.PE.Ratio.1, 3)
+
+dtfive$Supermarkets.OAS_MA<-NA
+dtfive[c(3:nrow(dtfive)),"Supermarkets.OAS_MA"]<-rollmean(dtfive$Supermarkets.OAS.1, 3)
+
+dtfive$VIX.Value_MA<-NA
+dtfive[c(3:nrow(dtfive)),"VIX.Value_MA"]<-rollmean(dtfive$VIX.Value.1, 3)
+
+dtfive$Total_MA<-NA
+dtfive[c(3:nrow(dtfive)),"Total_MA"]<-rollmean(dtfive$Total.1, 3)
+
+dtfive$TED.Rate_MA<-NA
+dtfive[c(3:nrow(dtfive)),"TED.Rate_MA"]<-rollmean(dtfive$TED.Rate.1, 3)
+
+
+
+dtchange2<-cbind(dtchange2,dtfive[,c(6:10)])
+
+# get flag for the next period
+dtchange2$newflag<- lead(dtchange2$flag)
+dtchange2<-dtchange2[,c(2:ncol(dtchange2))]
+
+dtchange2<-na.omit(dtchange2)
+```
+
+
+```{r}
+dt_tr<-dtchange2[c(1:170),]
+dt_te<-dtchange2[c(171:232),]
+set.seed(20)
+dt_xgb<-xgfunction(dt_tr)
+```
+
+```{r}
+rf.probs <- predict(dt_xgb,dt_te,type="prob")
+rf.ROC <- roc(predictor=rf.probs$Yes,
+               response=dt_te$newflag,
+               levels=rev(levels(as.factor(dt_te$newflag))))
+rf.ROC$auc
+```
+
+```{r}
+varImp(dt_xgb)
+```
+
+###Industrial
+```{r}
+dtchange2<-getSector("Industrial")
+dt_tr<-dtchange2[c(1:170),]
+dt_te<-dtchange2[c(171:232),]
+set.seed(500 )
+dt_xgb<-xgfunction(dt_tr)
+```
+
+```{r}
+predictions<-predict(dt_xgb,dt_te)
+t<-table(predictions=predictions,actual=dt_te$newflag)
+t
+```
+```{r}
+rf.probs <- predict(dt_xgb,dt_te,type="prob")
+rf.ROC <- roc(predictor=rf.probs$Yes,
+               response=dt_te$newflag,
+               levels=rev(levels(as.factor(dt_te$newflag))))
+rf.ROC$auc
+```
+
+```{r}
+varImp(dt_xgb)
+```
+
+
+### Energy
+
+```{r}
+dtchange2<-getSector("Energy")
+ dt_tr<-dtchange2[c(1:170),]
+dt_te<-dtchange2[c(171:232),]
+set.seed(500)
+dt_xgb<-xgfunction(dt_tr)
+```
+
+```{r}
+predictions<-predict(dt_xgb,dt_te)
+t<-table(predictions=predictions,actual=dt_te$newflag)
+t
+```
+
+```{r}
+rf.probs <- predict(dt_xgb,dt_te,type="prob")
+rf.ROC <- roc(predictor=rf.probs$Yes,
+               response=dt_te$newflag,
+               levels=rev(levels(as.factor(dt_te$newflag))))
+rf.ROC$auc
+```
+
+```{r}
+varImp(dt_xgb)
+```
+
+### Technology
+```{r}
+dtchange2<-getSector("Technology")
+dt_tr<-dtchange2[c(1:170),]
+dt_te<-dtchange2[c(171:232),]
+set.seed(500)
+dt_xgb<-xgfunction(dt_tr)
+```
+
+```{r}
+predictions<-predict(dt_xgb,dt_te)
+t<-table(predictions=predictions,actual=dt_te$newflag)
+t
+```
+```{r}
+rf.probs <- predict(dt_xgb,dt_te,type="prob")
+rf.ROC <- roc(predictor=rf.probs$Yes,
+               response=dt_te$newflag,
+               levels=rev(levels(as.factor(dt_te$newflag))))
+rf.ROC$auc
+```
+
+```{r}
+varImp(dt_xgb)
+```
+
+
+### Full data
+
+```{r}
+getFull<-function(x){
+  dt<-x
+  #Remove missing values
+  dtnew<-dt[ , -which(names(dt) %in% c("One.Month.Yield","Yield.1.Mo.Vol.63","Yield.1.Mo.Vol.21","VIX.VXV","VXV","Yield.30.Yr.Vol.63","Yield.30.Yr.Vol.21","Thirty.Year.Yield"))]
+  dtnew<-na.omit(dtnew)
+  
+  dtset <- dtnew[,c(1,5:73)]
+  
+  # get average
+  dtavg<- dtset %>% group_by(Date) %>% summarise_all("mean",na.rm=T)  
+  
+  # get delta OAS
+  dtavg$oasdelta<- ((dtavg$OAS - lag(dtavg$OAS))/lag(dtavg$OAS))*100
+  dtallnew<-dtavg[,-1]
+  
+  dtallnew[1,70]<-0
+  # get flag
+  dtallnew$flag<-ifelse(dtallnew$oasdelta >=0, 1,0)
+  
+  dtvar<-dtallnew[,c(1:66,68,69,71)]
+  
+  # get %change for all features
+  dtvar[,c(70:137)]<- ((dtvar[,c(1:68)] - dtvar[,c(1:68)] %>% mutate_all(lag))/(dtvar[,c(1:68)] %>% mutate_all(lag) )) *100
+  
+  # Add shiller 2 period change
+dtvar$Shiller.PE.Ratio.2<-  ((dtvar$Shiller.PE.Ratio - lag(lag(dtvar$Shiller.PE.Ratio))) / lag(lag(dtvar$Shiller.PE.Ratio)) ) *100
+
+dtvar$Total.Current.Liabilities.2<-  ((dtvar$Total.Current.Liabilities - lag(lag(dtvar$Total.Current.Liabilities))) / lag(lag(dtvar$Total.Current.Liabilities)) ) *100
+
+dtvar$SP.Index.2<-  ((dtvar$SP.Index - lag(lag(dtvar$SP.Index))) / lag(lag(dtvar$SP.Index)) ) *100
+
+dtvar$Interest.Expense.2<-  ((dtvar$Interest.Expense - lag(lag(dtvar$Interest.Expense))) / lag(lag(dtvar$Interest.Expense)) ) *100
+
+dtvar$Gross.Margin.2<-  ((dtvar$Gross.Margin - lag(lag(dtvar$Gross.Margin))) / lag(lag(dtvar$Gross.Margin)) ) *100
+
+
+
+
+dtchange<-dtvar[,c(69:142)]
+dtchange2<-na.omit(dtchange)
+
+# Add the rolling means for the most five important predictors
+dtfive<-dtchange2[,c("Shiller.PE.Ratio.1", "Total.Current.Liabilities.1", "SP.Index.1", "Interest.Expense.1", "Gross.Margin.1")] 
+
+
+dtfive$Shiller.PE.Ratio_MA<-NA
+dtfive[c(3:nrow(dtfive)),"Shiller.PE.Ratio_MA"]<-rollmean(dtfive$Shiller.PE.Ratio.1, 3)
+
+dtfive$Total.Current.Liabilities_MA<-NA
+dtfive[c(3:nrow(dtfive)),"Total.Current.Liabilities_MA"]<-rollmean(dtfive$Total.Current.Liabilities.1, 3)
+
+dtfive$SP.Index_MA<-NA
+dtfive[c(3:nrow(dtfive)),"SP.Index_MA"]<-rollmean(dtfive$SP.Index.1, 3)
+
+dtfive$Interest.Expense_MA<-NA
+dtfive[c(3:nrow(dtfive)),"Interest.Expense_MA"]<-rollmean(dtfive$Interest.Expense.1, 3)
+
+dtfive$Gross.Margin_MA<-NA
+dtfive[c(3:nrow(dtfive)),"Gross.Margin_MA"]<-rollmean(dtfive$Gross.Margin.1, 3)
+
+
+
+dtchange2<-cbind(dtchange2,dtfive[,c(6:10)])
+  
+  dtchange<-dtvar[,c(69:137)]
+  dtchange2<-na.omit(dtchange)
+  
+  # get flag for the next period
+  dtchange2$newflag<- lead(dtchange2$flag)
+  dtchange2<-dtchange2[,c(2:ncol(dtchange2))]
+}
+```
+
+```{r}
+dtchange2<-getFull(data)
+dt_tr<-dtchange2[c(1:170),]
+dt_te<-dtchange2[c(171:232),]
+set.seed(1)
+dt_xgb<-xgfunction(dt_tr)
+```
+
+```{r}
+predictions<-predict(dt_xgb,dt_te)
+t<-table(predictions=predictions,actual=dt_te$newflag)
+t
+```
+
+```{r}
+rf.probs <- predict(dt_xgb,dt_te,type="prob")
+rf.ROC <- roc(predictor=rf.probs$Yes,
+               response=dt_te$newflag,
+               levels=rev(levels(as.factor(dt_te$newflag))))
+rf.ROC$auc
+```
+
+```{r}
+varImp(dt_xgb)
+```
+
